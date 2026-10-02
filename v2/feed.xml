@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?><feed xmlns="http://www.w3.org/2005/Atom" ><generator uri="https://jekyllrb.com/" version="4.4.1">Jekyll</generator><link href="https://nishantc7.github.io/website-preview/v2/feed.xml" rel="self" type="application/atom+xml" /><link href="https://nishantc7.github.io/website-preview/v2/" rel="alternate" type="text/html" /><updated>2026-10-02T07:18:35+00:00</updated><id>https://nishantc7.github.io/website-preview/v2/feed.xml</id><title type="html">Nishant Choudhary</title><subtitle>Backend-focused Product Engineer. Distributed systems, event-driven architectures, scalable backend platforms, applied AI.</subtitle><author><name>Nishant Choudhary</name><email>nishant.choudh4ry.7@gmail.com</email></author><entry><title type="html">Audit logs at ClearFeed</title><link href="https://nishantc7.github.io/website-preview/v2/writing/2026/04/09/audit-logs-at-clearfeed/" rel="alternate" type="text/html" title="Audit logs at ClearFeed" /><published>2026-04-09T00:00:00+00:00</published><updated>2026-04-09T00:00:00+00:00</updated><id>https://nishantc7.github.io/website-preview/v2/writing/2026/04/09/audit-logs-at-clearfeed</id><content type="html" xml:base="https://nishantc7.github.io/website-preview/v2/writing/2026/04/09/audit-logs-at-clearfeed/"><![CDATA[<p>I owned ClearFeed’s audit logging system. It runs across all accounts, handles 10,000+ events a day, and backs the CSV exports enterprise customers hand to their auditors. This is about the decisions that shaped it and why I made them.</p>
+
+<h2 id="keeping-it-off-the-request-path">Keeping it off the request path</h2>
+
+<p>My first instinct was to write audit rows directly from request handlers into Postgres. It works until large account actions start fanning out to hundreds of audit events, or bulk imports fire thousands at once. Every customer action ends up waiting on Postgres.</p>
+
+<p>Audit logging cannot slow down or fail a user request. That ruled out synchronous writes from the start.</p>
+
+<h2 id="the-dispatcher-abstraction">The dispatcher abstraction</h2>
+
+<p>Once you go async, the natural move is calling <code class="language-plaintext highlighter-rouge">writeQueue.add()</code> wherever an audit event happens. But across 30 services, that spreads a BullMQ/Redis dependency through the codebase. Every caller knows they are talking to a queue.</p>
+
+<p>A dispatcher gives callers one thing to do: describe what happened.</p>
+
+<div class="language-ts highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="nx">audit</span><span class="p">.</span><span class="nf">dispatch</span><span class="p">(...)</span>
+</code></pre></div></div>
+
+<p>The caller does not know where the event goes next. Queueing, persistence, filtering, and retries stay outside the business logic. Services only describe what happened and move on.</p>
+
+<h2 id="processing-audit-events">Processing audit events</h2>
+
+<p>The dispatcher only publishes that something happened. The audit worker is responsible for turning that into an audit record.</p>
+
+<p>Different actions produce different audit records. A user update records changed fields. A resource access records who viewed what. A bulk operation may generate several audit entries from a single event. Keeping that logic in one place avoided audit-specific code leaking into request handlers.</p>
+
+<p>BullMQ (backed by Redis) provides the buffer between the application and Postgres. If the database is slow or unavailable, jobs wait in Redis and retry automatically rather than slowing down user requests.</p>
+
+<h2 id="pagination">Pagination</h2>
+
+<p>The list endpoint uses a cursor, not page numbers. Audit logs are append-only and constantly growing. With offset pagination, new rows shift page positions while someone paginates. Page 2 starts including entries they already saw on page 1, or skips some entirely.</p>
+
+<p>A cursor holds a fixed position in the log. New entries arriving in the background do not change where you are. For a system that keeps growing, cursor pagination ended up being the most reliable option.</p>
+
+<h2 id="the-shape-of-an-audit-record">The shape of an audit record</h2>
+
+<p>Each action type has different context. A field update records what changed and what it changed from. A resource access records that someone looked at something. These shapes are not the same, and there is no sensible way to put them into fixed columns without wasting most of those columns most of the time, or running schema migrations every time a new action type gets added.</p>
+
+<p><code class="language-plaintext highlighter-rouge">details</code> is a structured JSON blob that varies by action. It is always serialized deterministically so downstream tooling gets consistent output. The tradeoff is that querying inside <code class="language-plaintext highlighter-rouge">details</code> becomes harder, but that is fine because <code class="language-plaintext highlighter-rouge">details</code> is for context, not for querying. Everything you would actually filter on sits in its own indexed column.</p>
+
+<h2 id="making-source-queryable">Making source queryable</h2>
+
+<p>The <code class="language-plaintext highlighter-rouge">source</code> field tracks where an action came from: API, Dashboard, or Slack. I considered keeping it inside <code class="language-plaintext highlighter-rouge">details</code> early on because it looked cleaner.</p>
+
+<p>A bulk delete from the API looks different from the same delete from the Dashboard. If <code class="language-plaintext highlighter-rouge">source</code> lives inside a JSON blob, you cannot query for it efficiently. Pulling it out as an indexed column costs almost nothing and makes it queryable like any other filter.</p>
+
+<h2 id="handling-write-volume">Handling write volume</h2>
+
+<p>Writing every audit record individually worked at first. As volume grew, the database spent more time handling connection overhead, transaction overhead, and index updates than the writes themselves.</p>
+
+<p>The worker processes audit events in batches and writes them using a single bulk INSERT. Bulk writes amortize those costs across many rows in a single statement.</p>
+
+<p>Under normal load, batches stay small. During spikes, batching prevents the database from becoming the bottleneck while keeping write throughput predictable.</p>
+
+<p>I also indexed only the fields the API actually filters on: actor email, operation type, resource type, source, timestamps. The write path stayed fast and query performance stayed predictable as the table grew.</p>
+
+<h2 id="exporting-data">Exporting data</h2>
+
+<p>Compliance and security teams do not work inside your product. They pull audit data into spreadsheets, SIEM systems, internal dashboards. CSV is what people use when they are doing offline analysis or handing records to an auditor.</p>
+
+<p>The export had to stream. Loading a full result set into memory fails on large accounts with wide date ranges. The exporter reads in batches and writes directly to the CSV stream. That kept memory usage predictable even for large exports.</p>
+
+<h2 id="the-operational-details">The operational details</h2>
+
+<p>Behind AWS ALB (Application Load Balancer), the real client IP is in <code class="language-plaintext highlighter-rouge">X-Forwarded-For</code>, not the socket address. That one took a moment to catch.</p>
+
+<p>Slack-originated actions store a null IP.</p>
+
+<p>Async retries carry actor context forward. A delayed job needs to map back to the original user who triggered it, not appear as anonymous system activity when it eventually processes.</p>
+
+<h2 id="what-it-became">What it became</h2>
+
+<p>The system started as logging infrastructure. Once customers started depending on it for security reviews and compliance workflows, it became a production data path with the same reliability expectations as the rest of the product.</p>]]></content><author><name>Nishant Choudhary</name><email>nishant.choudh4ry.7@gmail.com</email></author><category term="engineering" /><category term="work" /><summary type="html"><![CDATA[The decisions behind ClearFeed's audit logging system — why async dispatch, why a listener in the middle, why batching, and how export works at scale.]]></summary></entry><entry><title type="html">Random Anime Reviews</title><link href="https://nishantc7.github.io/website-preview/v2/writing/2020/07/06/random-anime-reviews/" rel="alternate" type="text/html" title="Random Anime Reviews" /><published>2020-07-06T00:00:00+00:00</published><updated>2020-07-06T00:00:00+00:00</updated><id>https://nishantc7.github.io/website-preview/v2/writing/2020/07/06/random-anime-reviews</id><content type="html" xml:base="https://nishantc7.github.io/website-preview/v2/writing/2020/07/06/random-anime-reviews/"><![CDATA[<p>Here’s my first blog, and I can’t help but write about <strong>anime</strong>. They have become a part of my lifestyle and teach me trivial, though important aspects of life.</p>
+
+<h2 id="movies">Movies</h2>
+
+<p><strong>Kimi no Na wa [Your Name]</strong></p>
+
+<p><img src="https://i.imgur.com/sWbKISNr.jpg" alt="cover_knnw" /></p>
+
+<p>This is one the most beautiful movies I’ve ever watched. The animation and art is just beautiful. The scene where the meteorite splits in two in the sky is absolutely breathtaking. The concept of two people switching soul in the movie is not exactly the first in fantasy storytelling, but the way it has been executed is very fresh. The story leaves you craving more but also with somewhat peace of mind. The music is mesmerizing. I really loved the songs. All together this romantic, supernatural movie is a <strong><em>must watch</em></strong> according to me.</p>
+
+<h3 id="shows">Shows</h3>
+
+<p><strong>Kizumonogatari : Tekketsu-Hen/Nekketsu-Hen</strong></p>
+
+<p>Currently Watching. Order recommended:</p>
+
+<ul>
+  <li>Bakemonogatari</li>
+  <li>Nisemonogatari</li>
+  <li>Nekomonogatari:Kuro</li>
+  <li>Monogatari Series Second Season</li>
+  <li>Hanamonogatari</li>
+  <li>Tsukimonogatari</li>
+  <li>Owarimonogatari (I)</li>
+  <li>Koyomimonogatari</li>
+  <li>Kizumonogatari</li>
+</ul>
+
+<p>More information on the series order or the series in general can be found in the <a href="https://www.reddit.com/r/araragi/comments/253p64/the_orders_to_monogatari_condensed_version">monogatari subreddit</a>.</p>
+
+<p><strong>Yahari Ore no Seishun Love Comedy wa Machigatteiru. Zoku</strong></p>
+
+<p><img src="https://media.giphy.com/media/ThndUIbw1Znbi/giphy.gif" alt="cover_oregairuzokuova" /></p>
+
+<p><em>Hachiman</em> is the closest character to portray my thoughts. When I’d see a scene and try to think about something which is not very trivial about the scene, like for example where <em>Hachiman</em> thinks to himself if he was born 10 years ago he would have married sensei, the mood set in there was not about him thinking that. But He did it anyway. These are kind of the little thoughts we do not give much value to. These are just trivial thoughts, shows skip these, maybe even think it’s not appropriate to always show the trivial thoughts! Anyway I love <em>Oregairu</em> for that. It rips apart the norm of keeping trivial thoughts unheard. In some way I find it very close to the <em>Monogatari Series</em>, the complicated yet rational thoughts, simple irrational thougts, long sentences in a single breath. I just love it.</p>
+
+<p><strong>Nisekoi</strong></p>
+
+<p><img src="https://i.imgur.com/OQlCSQ7.png" alt="cover_nisekoi2ova" /></p>
+
+<p><strong>#teamonodera.</strong> Now that all the <em>Chitoge</em> fans are gone, I love the series just because I love <em>Onodera</em>. She’s just too damn cute. And all the cute faces she makes! I think <em>Nisekoi</em> probably should win the <strong>most-different-faces-of-the-same-character-award</strong>. Coming to the OVA I was actually thinking there would be a 3rd season (no updates yet)! But I enjoyed just being able to spend more time with the comfortable characters after a long time! So thumbs up for this one! I went ahead to read the manga and that definitely does’nt disappoint!</p>
+
+<p><strong>Boku Dake ga Inai Machi [Erased]</strong></p>
+
+<p><img src="https://i.imgur.com/h9dZ4SQ.jpg" alt="cover_erased" /></p>
+
+<p>I noticed the popularity of Erased when it released. Since it scored pretty high on <a href="https://myanimelist.net/anime/31043/Boku_dake_ga_Inai_Machi">MAL</a> I thought I’d save up the series for a later watch. But when I heard some <strong><em>HUGE</em></strong> spoiler, I just got heartbroken. I thought I should just get over with it. But the end results were pretty different from what I had expected. The series has average visuals, nothing too fancy. But the story is good. A 29 year old manga artist has a certain power to prevent bad things from happening around himself. But things roll quickly once his mother gets murdered. He has to remeber the memories he once forgotten. However unlike many I would say Erased was not pointed towards being a romantic love story. So watch it for the plot.</p>
+
+<p><strong>Boku no Hero Academia [My Hero Academia]</strong></p>
+
+<p><img src="https://i.imgur.com/ghOmGsw.jpg" alt="cover_myheroac" /></p>
+
+<p>Watched <em>One Punch Man</em>? Want something similarly action packed and in a similar setting? Look no more. <em>Boku no Hero Academia</em> was one of the most enjoyable and fun series for me! It’s art style is more comic but reminds me of <em>OPM</em>. The animation is very good. <strong>Heroes are born with Quirks</strong>. Our main character does not have any quirk <em>(heh.. talk about stereotype)</em>. Can he become a hero? After he meets the legendary hero <strong>All Might</strong>, his life changes forever. I don’t think there are many who have not already watched this show and if you have not then you should watch right now. It’s very newcomer friendly.</p>
+
+<p><strong>Re:Zero kara Hajimeru Isekai Seikatsu</strong></p>
+
+<p><img src="https://i.imgur.com/QLXw4sB.png" alt="cover_rezero" /></p>
+
+<p>This one is one of my latest watches. I love <strong><em>stuck-in-the-MMORPG-have-to-lead-a-life-there</em></strong> kind of anime. This one started good enough, though I had some trouble understanding how he entered the game. Anyway, things got very serious very fast! I couldn’t even get comfortable with the characters yet and there was blood splattering all over in first episode. But after that it became a little predictable (Hint: <em>Steins;Gate</em>). But after reaching mid season things changed drasticly. I started getting <em>really</em> pissed on the main character, but <strong>Rem</strong> took away all my worries! The series is very well written and the psychlogical impact of this is undeniable. It is definitely worth a watch if you’ve not got caught up in the very notable Re:Zero hype and watched it already!</p>
+
+<p><strong>Haikyuu</strong></p>
+
+<p><img src="https://i.imgur.com/iTs0UDg.jpg" alt="cover_haikyuu3" /></p>
+
+<p>Ending my list with probably my most <strong>adrenaline filled</strong> anime on this list! I am not particularly a fan of sports anime but this was different. Haikyuu is one of those shounen anime that never lets you down with a boring episode. The tension is always in the air. There is no telling when suddenly someone unnoticed from opponent team is going to shine just when you were feeling confident! Haikyuu means <em>volleyball</em> literally! I’ve often heard <em>Haikyuu</em> is one the most accurate sports anime out there. Though I personally have not much experience in volleyball, I could feel the hard work that goes into the game just to be able to play even 5 minutes in a real match! The struggle is very well shown in the series. I recommend you start watching right now.</p>
+
+<h3 id="heres-my-myanimelist-for-some-more-references-thanks-for-reading-till-the-end-">Here’s my <a href="https://myanimelist.net/animelist/nishantc7?status=7&amp;order=4&amp;order2=0">myanimelist</a> for some more references. Thanks for reading till the end :)</h3>]]></content><author><name>Nishant Choudhary</name><email>nishant.choudh4ry.7@gmail.com</email></author><category term="personal" /><summary type="html"><![CDATA[First blog from 2020 — recommendations on Kimi no Na wa, Haikyuu, Re:Zero, Erased, Boku no Hero Academia, and more.]]></summary></entry></feed>
